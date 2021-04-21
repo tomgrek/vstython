@@ -7,8 +7,8 @@
 */
 
 #include <JuceHeader.h>
-#include "TomHeader.h"
-#include "AudioPluginDemo.h"
+#include "typhon_utils.h"
+#include "VSTyphon.h"
 
 //==============================================================================
 juce::AudioProcessor* JUCE_CALLTYPE createPluginFilter()

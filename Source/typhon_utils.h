@@ -1,7 +1,6 @@
 #pragma once
 
-typedef struct pycom {
-    bool did_get;
+struct pycom {
     int note;
     float vol;
 };
@@ -9,27 +8,19 @@ typedef struct pycom {
 class Pyaudio {
 public:
     Pyaudio() {
-        did_get = false;
         seqnum = 0;
-        audio = std::make_unique<MemoryBlock>();
+        audio = std::make_unique<MemoryBlock>(3840);
     }
     ~Pyaudio() {}
-    bool did_get;
     int seqnum; // dont play if its same as last time
     std::unique_ptr<juce::MemoryBlock> audio;
-    bool written = true;
     void reset() {
         audio->reset();
-        did_get = false;
         seqnum = 0;
     }
-    void set(juce::MemoryBlock newaudio) {
+    void set(juce::MemoryBlock newaudio, int seqnum_) {
         audio->swapWith(newaudio);
-        did_get = true;
-        seqnum++;
-        if (seqnum == 500) {
-            DBG("is 500");
-        }
+        seqnum = seqnum_;
     }
     juce::MemoryBlock* get() {
         return audio.get();
@@ -40,12 +31,11 @@ class Connection : public juce::InterprocessConnection, juce::ActionBroadcaster,
 {
 public:
     Connection(juce::WaitableEvent& stop_signal)
-        : InterprocessConnection(false, 15),
+        : InterprocessConnection(true, 15),
         stop_signal_(stop_signal)
     {
-        using Ptr = ReferenceCountedObjectPtr<Connection>;
-        
-        audiomsg = std::make_unique<Pyaudio>();
+        audiomsg = std::make_unique<Pyaudio[]>(BUF_SIZE);
+        memory_block_ = std::make_unique<juce::MemoryBlock>();
     }
 
     void connectionMade() override
@@ -60,15 +50,11 @@ public:
     void connectionLost() override
     {
         DBG("Connection lost\n");
-        audiomsg->reset();
-        //disconnect();
     }
 
     void messageReceived(const juce::MemoryBlock& msg) override
     {
-        audiomsg->set(msg);
-        // 
-        // 
+        audiomsg[seqnum++ % BUF_SIZE].set(msg, seqnum);
         /*
         Here's the working code for MIDI
         midimsg = { true, 60, (float)0.8 };
@@ -89,34 +75,43 @@ public:
             stop_signal_.signal();
         }*/
     }
-    Pyaudio* gotMsg() {
-        if (this == nullptr) return nullptr; // return new Pyaudio();
-
-        return audiomsg.get();
+    Pyaudio* gotMsg(int theirSeqnum) {
+        auto msg = &audiomsg[lastGot++ % BUF_SIZE];
+        auto x = msg->get();
+        tmp_audio.audio->replaceWith(x->getData(), x->getSize());
+        tmp_audio.seqnum = msg->seqnum;
+        msg->audio->fillWith(0);
+        msg->seqnum = 0;
+        return &tmp_audio;
     }
     void clearMsg() {
-        audiomsg->reset();
+        audiomsg[seqnum].reset();
     }
     template <typename FloatType>
     void transmit(AudioBuffer<FloatType>& buffer) {
+        int chunkSize = buffer.getNumSamples() * sizeof(float);
+        if (!chunkSize) return;
         
-        if (!buffer.getNumSamples()) return;
-        memory_block_ = std::make_unique<juce::MemoryBlock>(buffer.getNumSamples() * buffer.getNumChannels() * sizeof(double));
-        memory_block_.get()->copyFrom(buffer.getReadPointer(0, 0), 0, buffer.getNumSamples() * sizeof(double));
-        memory_block_.get()->append(buffer.getReadPointer(1, 0), buffer.getNumSamples() * sizeof(double));
+        memory_block_ = std::make_unique<juce::MemoryBlock>(chunkSize * buffer.getNumChannels());
+        //DBG(buffer.getNumSamples() << " chans " << buffer.getNumChannels() << " size " << sizeof(float));
+        auto mb = memory_block_.get();
 
-        memory_block_->ensureSize(buffer.getNumSamples() * sizeof(double) * 2, true);
-        sendMessage(*memory_block_.get());
-        //audiomsg->set(*memory_block_.get());// <------------------------the key to doing it locally.
-
+        mb->copyFrom((FloatType*)buffer.getReadPointer(0, 0), 0, chunkSize);
+        mb->copyFrom((FloatType*)buffer.getReadPointer(1, 0), chunkSize, chunkSize);
+        jassert(mb->getSize() == (chunkSize * buffer.getNumChannels()));
+        sendMessage(*mb);
     }
 
 private:
     juce::WaitableEvent& stop_signal_;
     std::unique_ptr<juce::MemoryBlock> memory_block_{ nullptr };
+    Pyaudio tmp_audio;
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(Connection);
+    int seqnum = 0;
+    int lastGot = 0;
+    int BUF_SIZE = 100;
 protected:
-    std::unique_ptr<Pyaudio> audiomsg;
+    std::unique_ptr<Pyaudio[]> audiomsg;
 };
 
 class IPCServer : public juce::InterprocessConnectionServer
@@ -125,7 +120,6 @@ public:
     IPCServer(juce::WaitableEvent& stop_signal)
         : stop_signal_(stop_signal), connection_(nullptr)
     {
-        
     }
 
     ~IPCServer()
@@ -134,10 +128,8 @@ public:
             connection_->disconnect();
         }
     }
-    Pyaudio* gotMsg() {
-        Pyaudio* msg = connection_->gotMsg();
-        //if (msg->did_get) connection_->clearMsg();
-        return msg;
+    Pyaudio* gotMsg(int seqnum) {
+        return connection_->gotMsg(seqnum);
     }
     bool isConnected() {
         if (!connection_) return false;
