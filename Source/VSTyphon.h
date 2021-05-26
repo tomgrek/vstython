@@ -155,67 +155,52 @@ private:
 };
 
 
-
-
-
-
-
-
-
-
 class JuceDemoPluginAudioProcessor  : public AudioProcessor
 {
 public:
-    
     class TomThreader : public juce::Thread {
     public:
         TomThreader() : Thread("wot") {
             server = std::make_unique<IPCServer>(stop_signal);
         }
         ~TomThreader() {
-            server = nullptr;
         }
         juce::WaitableEvent stop_signal;
         std::unique_ptr<IPCServer> server;
+
+        void setInfo(std::string info)
+        {
+            server->saveTimecodeInfo(info);
+        }
 
         void run() override
         {
 
 
-            while (!juce::Thread::threadShouldExit())
+            while (!threadShouldExit())
             {
                 if (server->beginWaitingForSocket(11586)) {
-                    while (!stop_signal.wait(1000)) {
+                    while (!stop_signal.wait(1)) {
                         // safe to do nothing here but have to reconnect python side
                     }
-                    DBG("madeanoops");
+                    server->stop();
                 }
+                server->stop();
             }
-            DBG("FINISHING HERE");
+            server->stop();
         }
 
-        juce::MidiMessage getMidi() {
-            MidiMessage midi = MidiMessage::noteOff(1, last_note);
-            /*pyaudio zig = server->gotMsg();
-            if (zig.did_get) {
-                last_note = zig.note;
-                midi = MidiMessage::noteOn(1, zig.note, zig.vol);
-            }*/
-
-            return midi;
-        }
-
-        Pyaudio* getAudio(int seqnum) {
-            return server->gotMsg(seqnum);
+        Pyaudio* getAudioAndMidi() {
+            return server->gotMsg();
         }
 
         bool getPanic() {
             return last_note == -1;
         }
         template <typename FloatType>
-        void transmit(AudioBuffer<FloatType>& buffer) {
+        void transmit(AudioBuffer<FloatType>& buffer, MidiBuffer& midiBuffer) {
             if (server->isConnected()) {
-                server->transmit(buffer);
+                server->transmit(buffer, midiBuffer);
             }
         }
         bool isConnected() {
@@ -232,20 +217,38 @@ public:
         : AudioProcessor (getBusesProperties()),
           state (*this, nullptr, "state",
                  { std::make_unique<AudioParameterFloat> ("gain",  "Gain",           NormalisableRange<float> (0.0f, 1.0f), 0.9f),
-                   std::make_unique<AudioParameterFloat> ("delay", "Delay Feedback", NormalisableRange<float> (0.0f, 1.0f), 0.5f) })
+                   std::make_unique<AudioParameterFloat> ("delay", "Delay Feedback", NormalisableRange<float> (0.0f, 1.0f), 0.5f),
+                   std::make_unique<AudioParameterBool>("midiProcess", "Process MIDI", true),
+                   std::make_unique<AudioParameterBool>("internalSynth", "Built-in Synth", true) })
     {
         // Add a sub-tree to store the state of our UI
-        state.state.addChild ({ "uiState", { { "width",  400 }, { "height", 200 } }, {} }, -1, nullptr);
+        state.state.addChild ({ "uiState", { { "width",  460 }, { "height", 300 } }, {} }, -1, nullptr);
 
         initialiseSynth();
 
+        std::string timeInfo = "";
+        AudioPlayHead::CurrentPositionInfo result;
+        if (auto* ph = getPlayHead())
+        {
+            if (ph->getCurrentPosition(result)) {
+                timeInfo = std::to_string(result.bpm);
+            }
+        }
+        if (timeInfo == "") {
+            AudioPlayHead::CurrentPositionInfo result;
+            result.resetToDefault();
+            timeInfo = std::to_string(result.bpm);
+        }
+
+        // If the host fails to provide the current time, we'll just use default values
+        
+        tomThread.setInfo(timeInfo.substr(0, 5));
         tomThread.startThread();
         
         
 
     }
     ~JuceDemoPluginAudioProcessor() override {
-        DBG("killingithere");
         tomThread.stop_signal.signal();
         tomThread.stopThread(1000);
     }
@@ -278,18 +281,7 @@ public:
         // initialisation that you need..
         synth.setCurrentPlaybackSampleRate (newSampleRate);
         keyboardState.reset();
-
-        if (isUsingDoublePrecision())
-        {
-            delayBufferDouble.setSize (2, 12000);
-            delayBufferFloat .setSize (1, 1);
-        }
-        else
-        {
-            delayBufferFloat .setSize (2, 12000);
-            delayBufferDouble.setSize (1, 1);
-        }
-
+        delayBufferFloat .setSize (2, 12000);
         reset();
     }
 
@@ -302,11 +294,7 @@ public:
 
     void reset() override
     {
-        // Use this method as the place to clear any delay lines, buffers, etc, as it
-        // means there's been a break in the audio's continuity.
-        DBG("clearnig delay buf");
         delayBufferFloat .clear();
-        delayBufferDouble.clear();
     }
 
     //==============================================================================
@@ -314,12 +302,6 @@ public:
     {
         jassert (! isUsingDoublePrecision());
         process (buffer, midiMessages, delayBufferFloat);
-    }
-
-    void processBlock (AudioBuffer<double>& buffer, MidiBuffer& midiMessages) override
-    {
-        jassert (isUsingDoublePrecision());
-        process (buffer, midiMessages, delayBufferDouble);
     }
 
     //==============================================================================
@@ -410,15 +392,10 @@ public:
     };
 
     MidiKeyboardState keyboardState;
-
     SpinLockedPosInfo lastPosInfo;
-
-    // Our plug-in's current state
     AudioProcessorValueTreeState state;
 
 private:
-    //==============================================================================
-    /** This is the editor component that our filter will display. */
     class JuceDemoPluginAudioProcessorEditor  : public AudioProcessorEditor,
                                                 private Timer,
                                                 private Value::Listener
@@ -426,9 +403,11 @@ private:
     public:
         JuceDemoPluginAudioProcessorEditor(JuceDemoPluginAudioProcessor& owner)
             : AudioProcessorEditor(owner),
-              midiKeyboard         (owner.keyboardState, MidiKeyboardComponent::horizontalKeyboard),
-              gainAttachment       (owner.state, "gain",  gainSlider),
-              delayAttachment      (owner.state, "delay", delaySlider)
+            midiKeyboard(owner.keyboardState, MidiKeyboardComponent::horizontalKeyboard),
+            gainAttachment(owner.state, "gain", gainSlider),
+            delayAttachment(owner.state, "delay", delaySlider),
+            midiProcessAttachment(owner.state, "midiProcess", midiProcessSlider),
+            internalSynthSliderAttachment(owner.state, "internalSynth", internalSynthSlider)
 
         {
             // add some sliders..
@@ -438,6 +417,13 @@ private:
             addAndMakeVisible (delaySlider);
             delaySlider.setSliderStyle (Slider::Rotary);
 
+            addAndMakeVisible(midiProcessSlider);
+            addAndMakeVisible(internalSynthSlider);
+            midiProcessLabel.attachToComponent(&midiProcessSlider, false);
+            midiProcessLabel.setFont(Font(11.0f));
+            internalSynthLabel.attachToComponent(&internalSynthSlider, false);
+            internalSynthLabel.setFont(Font(11.0f));
+
             // add some labels for the sliders..
             gainLabel.attachToComponent (&gainSlider, false);
             gainLabel.setFont (Font (11.0f));
@@ -445,30 +431,23 @@ private:
             delayLabel.attachToComponent (&delaySlider, false);
             delayLabel.setFont (Font (11.0f));
 
-            // add the midi keyboard component..
             addAndMakeVisible (midiKeyboard);
-
-            // add a label that will display the current timecode and status..
             addAndMakeVisible (timecodeDisplayLabel);
             timecodeDisplayLabel.setFont (Font (Font::getDefaultMonospacedFontName(), 15.0f, Font::plain));
 
-            // set resize limits for this plug-in
-            setResizeLimits (400, 200, 1024, 700);
+            setResizeLimits (460, 300, 1024, 700);
             setResizable (true, owner.wrapperType != wrapperType_AudioUnitv3);
 
             lastUIWidth .referTo (owner.state.state.getChildWithName ("uiState").getPropertyAsValue ("width",  nullptr));
             lastUIHeight.referTo (owner.state.state.getChildWithName ("uiState").getPropertyAsValue ("height", nullptr));
 
-            // set our component's initial size to be the last one that was stored in the filter's settings
             setSize (lastUIWidth.getValue(), lastUIHeight.getValue());
 
             lastUIWidth. addListener (this);
             lastUIHeight.addListener (this);
 
             updateTrackProperties();
-
-            // start a timer which will keep our timecode display updated
-            startTimerHz (30);
+            startTimerHz (10);
         }
 
         ~JuceDemoPluginAudioProcessorEditor() override {}
@@ -482,17 +461,16 @@ private:
 
         void resized() override
         {
-            // This lays out our child components...
-
             auto r = getLocalBounds().reduced (8);
-
             timecodeDisplayLabel.setBounds (r.removeFromTop (26));
             midiKeyboard        .setBounds (r.removeFromBottom (70));
 
             r.removeFromTop (20);
             auto sliderArea = r.removeFromTop (60);
-            gainSlider.setBounds  (sliderArea.removeFromLeft (jmin (180, sliderArea.getWidth() / 2)));
-            delaySlider.setBounds (sliderArea.removeFromLeft (jmin (180, sliderArea.getWidth())));
+            gainSlider.setBounds  (sliderArea.removeFromLeft (jmin (180, sliderArea.getWidth() / 3)));
+            delaySlider.setBounds (sliderArea.removeFromLeft (jmin (180, sliderArea.getWidth() / 2)));
+            midiProcessSlider.setBounds(sliderArea.removeFromLeft(jmin(120, sliderArea.getWidth())));
+            internalSynthSlider.setBounds(8, jmin(sliderArea.getHeight()*3, 120), jmax(sliderArea.getWidth(), 120), jmin(sliderArea.getHeight(), 180));
 
             lastUIWidth  = getWidth();
             lastUIHeight = getHeight();
@@ -513,10 +491,16 @@ private:
             if (&control == &gainSlider)
                 return 0;
 
-if (&control == &delaySlider)
-return 1;
+            if (&control == &delaySlider)
+                return 1;
 
-return -1;
+            if (&control == &midiProcessSlider)
+                return 2;
+            
+            if (&control == &midiProcessSlider)
+                return 3;
+
+            return -1;
         }
 
         void updateTrackProperties()
@@ -533,10 +517,12 @@ return -1;
         MidiKeyboardComponent midiKeyboard;
         Label timecodeDisplayLabel,
             gainLabel{ {}, "Throughput level:" },
-            delayLabel{ {}, "Delay:" };
+            delayLabel{ {}, "Delay:" },
+            midiProcessLabel{ {}, "Process Midi: " },
+            internalSynthLabel{ {}, "Built-in Synth: " };
 
-        Slider gainSlider, delaySlider;
-        AudioProcessorValueTreeState::SliderAttachment gainAttachment, delayAttachment;
+        Slider gainSlider, delaySlider, midiProcessSlider, internalSynthSlider;
+        AudioProcessorValueTreeState::SliderAttachment gainAttachment, delayAttachment, midiProcessAttachment, internalSynthSliderAttachment;
         Colour backgroundColour;
         Value lastUIWidth, lastUIHeight;
 
@@ -545,53 +531,13 @@ return -1;
             return static_cast<JuceDemoPluginAudioProcessor&> (processor);
         }
 
-        // quick-and-dirty function to format a timecode string
-        static String timeToTimecodeString(double seconds)
-        {
-            auto millisecs = roundToInt(seconds * 1000.0);
-            auto absMillisecs = std::abs(millisecs);
-
-            return String::formatted("%02d:%02d:%02d.%03d",
-                millisecs / 3600000,
-                (absMillisecs / 60000) % 60,
-                (absMillisecs / 1000) % 60,
-                absMillisecs % 1000);
-        }
-
-        // quick-and-dirty function to format a bars/beats string
-        static String quarterNotePositionToBarsBeatsString(double quarterNotes, int numerator, int denominator)
-        {
-            if (numerator == 0 || denominator == 0)
-                return "1|1|000";
-
-            auto quarterNotesPerBar = (numerator * 4 / denominator);
-            auto beats = (fmod(quarterNotes, quarterNotesPerBar) / quarterNotesPerBar) * numerator;
-
-            auto bar = ((int)quarterNotes) / quarterNotesPerBar + 1;
-            auto beat = ((int)beats) + 1;
-            auto ticks = ((int)(fmod(beats, 1.0) * 960.0 + 0.5));
-
-            return String::formatted("%d|%d|%03d", bar, beat, ticks);
-        }
-
         
         void updateTimecodeDisplay(AudioPlayHead::CurrentPositionInfo pos)
         {
             MemoryOutputStream displayText;
 
-            //displayText 
-            //    << String(pos.bpm, 2) << " bpm, "
-            //    << pos.timeSigNumerator << '/' << pos.timeSigDenominator
-            //    << "  -  " << timeToTimecodeString(pos.timeInSeconds)
-            //    << "  -  " << quarterNotePositionToBarsBeatsString(pos.ppqPosition,
-            //        pos.timeSigNumerator,
-            //        pos.timeSigDenominator);
-
-            //if (pos.isRecording)
-            //    displayText << "  (recording)";
-            //else if (pos.isPlaying)
-            //    displayText << "  (playing)";
-    
+            displayText << String(pos.bpm, 2) << " bpm | ";
+                
             if (getProcessor().tomThread.isConnected()) {
                 displayText << "Connected";
             } else {
@@ -612,50 +558,41 @@ return -1;
     {
         auto gainParamValue = state.getParameter("gain")->getValue();
         auto delayParamValue = state.getParameter("delay")->getValue();
+        auto midiProcessParamValue = state.getParameter("midiProcess")->getValue();
+        auto internalSynthParamValue = state.getParameter("internalSynth")->getValue();
         int numSamples = buffer.getNumSamples();
         int numChannels = buffer.getNumChannels();
-        keyboardState.processNextMidiBuffer(midiMessages, 0, numSamples, true);
 
-        synth.renderNextBlock(buffer, midiMessages, 0, numSamples);
+        keyboardState.processNextMidiBuffer(midiMessages, 0, numSamples, true);
+        if (!midiProcessParamValue) {
+            synth.renderNextBlock(buffer, midiMessages, 0, numSamples);
+        }
 
         if (tomThread.isConnected()) {
-            tomThread.transmit(buffer);
-            Pyaudio* audio = tomThread.getAudio(seqnum);
-                
-            //buffer.setDataToReferTo((FloatType **)audio->get()->getData(), 2, 480);
-            // ^^ that MIGHT work, later on
+            tomThread.transmit(buffer, midiMessages);
+            Pyaudio* audioAndMidi = tomThread.getAudioAndMidi();
 
-            float* memory_block = reinterpret_cast<float*>(audio->get()->getData());
+            float* memory_block = reinterpret_cast<float*>(audioAndMidi->getAudio()->getData());
             auto **data = buffer.getArrayOfWritePointers();
             for (int ch = 0; ch < numChannels; ch++) {
                 for (auto i = 0; i < numSamples; i++) {
                     data[ch][i] = (float)memory_block[i + (ch * numSamples)];
                 }
             }
-            //if (audio->seqnum == 500) {
-            //    for (int ch = 0; ch < numChannels; ch++) {
-            //        for (auto i = 0; i < numSamples; i++) {
-            //            DBG("at " << i << " data " << data[ch][i]);
-            //        }
-            //    }
-            //    DBG("is500");
-            //}
-            //DBG(buffer.getRMSLevel(0, 0, numSamples));
-            //seqnum = audio->seqnum;
+            uint8* midi_memory_block = reinterpret_cast<uint8*>(audioAndMidi->getMidi()->getData());
+            MidiBuffer x = MidiBuffer();
+            for (int i = 0; i < 300; i+=3) {
+                MidiMessage xm = MidiMessage(midi_memory_block[i], midi_memory_block[i + 1], midi_memory_block[i + 2], 0);
+                x.addEvent(xm, 0); // just add sequentially, it *is* missing precise timing offset info.
+            }
+            if (midiProcessParamValue && internalSynthParamValue) {
+                synth.renderNextBlock(buffer, x, 0, numSamples);
+            }
         }
         seqnum++;
-        //DBG("C++ seqnum " << seqnum << " recvd seqnum " << audio->seqnum);
-        //Time::waitForMillisecondCounter(Time::getMillisecondCounter() + 100);
-        delayBuffer.clear();
-        //applyGain(buffer, delayBuffer, gainParamValue);
-
-        //MidiBuffer& newMessages = MidiBuffer(midi);
-
-        
-        //applyDelay (buffer, delayBuffer, delayParamValue);
-
-        //updateCurrentTimeInfoFromHost();
-
+        applyGain(buffer, delayBuffer, gainParamValue);
+        applyDelay (buffer, delayBuffer, delayParamValue);
+        updateCurrentTimeInfoFromHost();
     }
 
     template <typename FloatType>
@@ -695,7 +632,6 @@ return -1;
     }
 
     AudioBuffer<float> delayBufferFloat;
-    AudioBuffer<double> delayBufferDouble;
 
     int delayPosition = 0;
     int seqnum = 0;
@@ -708,12 +644,8 @@ return -1;
     void initialiseSynth()
     {
         auto numVoices = 8;
-
-        // Add some voices...
         for (auto i = 0; i < numVoices; ++i)
             synth.addVoice (new SineWaveVoice());
-
-        // ..and give the synth a sound to play
         synth.addSound (new SineWaveSound());
     }
 
